@@ -1,0 +1,7 @@
+ark:
+  api_key: ""
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  model: "deepseek-v3-1-terminus"
+
+# database:
+#   dsn: "user:pass@tcp(127.0.0.1:3306)/dbname"
