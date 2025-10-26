@@ -215,3 +215,124 @@ func (r *Repository) ProcessEnrichedQuestion(
 		return QuestionInsertStatusSuccess, nil
 	}
 }
+
+// ListArticles 获取文章列表（按 ID 降序，支持 tag 筛选）
+func (r *Repository) ListArticles(ctx context.Context, tags []string, limit, offset int) ([]Article, int64, error) {
+	var articles []Article
+	var total int64
+
+	query := r.db.WithContext(ctx).Model(&Article{})
+
+	// 如果有 tag 筛选条件
+	if len(tags) > 0 {
+		// tags @> ? 表示 Article.Tags 数组包含查询的所有 tags
+		query = query.Where("tags @> ?", pq.Array(tags))
+	}
+
+	// 获取总数
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, fmt.Errorf("failed to count articles: %w", err)
+	}
+
+	// 获取分页数据
+	err := query.Order("id DESC").
+		Limit(limit).
+		Offset(offset).
+		Find(&articles).Error
+
+	if err != nil {
+		return nil, total, fmt.Errorf("failed to list articles: %w", err)
+	}
+
+	return articles, total, nil
+}
+
+// VectorSearchArticles 向量相似度搜索
+func (r *Repository) VectorSearchArticles(ctx context.Context, queryVector []float32, limit int) ([]Article, []float64, error) {
+	var articles []Article
+
+	// 使用原始 SQL 进行向量相似度搜索
+	// <#> 是内积距离运算符（值越小越相似，因为向量已归一化）
+	// 返回相似度 = 1 - distance（值越大越相似）
+	query := `
+		SELECT *, 1 - (embedding <#> ?) AS similarity
+		FROM articles
+		ORDER BY embedding <#> ?
+		LIMIT ?
+	`
+
+	pgVec := pgvector.NewVector(queryVector)
+
+	rows, err := r.db.WithContext(ctx).Raw(query, pgVec, pgVec, limit).Rows()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to execute vector search: %w", err)
+	}
+	defer rows.Close()
+
+	similarities := make([]float64, 0, limit)
+
+	for rows.Next() {
+		var article Article
+		var similarity float64
+
+		err := r.db.ScanRows(rows, &article)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to scan article row: %w", err)
+		}
+
+		// 手动读取 similarity 列
+		if err := rows.Scan(
+			&article.ID,
+			&article.OriginalQuestion,
+			&article.DetailedQuestion,
+			&article.ConciseAnswer,
+			&article.Tags,
+			&article.Embedding,
+			&article.Ext,
+			&article.NotionPageID,
+			&article.LastSyncedAt,
+			&article.CreatedAt,
+			&similarity,
+		); err != nil {
+			return nil, nil, fmt.Errorf("failed to scan similarity: %w", err)
+		}
+
+		articles = append(articles, article)
+		similarities = append(similarities, similarity)
+	}
+
+	return articles, similarities, nil
+}
+
+// GetArticleByID 根据 ID 获取文章
+func (r *Repository) GetArticleByID(ctx context.Context, id uint) (*Article, error) {
+	var article Article
+	err := r.db.WithContext(ctx).First(&article, id).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("article not found")
+		}
+		return nil, fmt.Errorf("failed to get article: %w", err)
+	}
+	return &article, nil
+}
+
+// GetAllTags 获取所有不重复的 tag
+func (r *Repository) GetAllTags(ctx context.Context) ([]string, error) {
+	var tags []string
+
+	// 使用 PostgreSQL 的 unnest 函数展开数组，然后去重
+	query := `
+		SELECT DISTINCT unnest(tags) AS tag
+		FROM articles
+		WHERE tags IS NOT NULL AND array_length(tags, 1) > 0
+		ORDER BY tag
+	`
+
+	err := r.db.WithContext(ctx).Raw(query).Scan(&tags).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all tags: %w", err)
+	}
+
+	return tags, nil
+}

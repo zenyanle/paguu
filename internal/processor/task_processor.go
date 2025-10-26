@@ -8,6 +8,7 @@ import (
 	"paguu/internal/embedding"
 	"paguu/internal/enrich"
 	"paguu/internal/storage/postgres"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,17 +59,22 @@ func (t *Task) FromJSON(data datatypes.JSON) error {
 }
 
 type TaskProcessor struct {
-	enricher *enrich.QuestionsEnricher
-	repo     *postgres.Repository
-	embedder *embedding.Embedder
+	enricher      *enrich.QuestionsEnricher
+	repo          *postgres.Repository
+	embedder      *embedding.Embedder
+	activeWorkers atomic.Int32
+	maxWorkers    int32
 }
 
 func NewTaskProcessor(enricher *enrich.QuestionsEnricher, repo *postgres.Repository, embedder *embedding.Embedder) *TaskProcessor {
-	return &TaskProcessor{
-		enricher: enricher,
-		repo:     repo,
-		embedder: embedder,
+	tp := &TaskProcessor{
+		enricher:   enricher,
+		repo:       repo,
+		embedder:   embedder,
+		maxWorkers: 3, // 默认最大并发数为3
 	}
+	tp.activeWorkers.Store(0)
+	return tp
 }
 
 func (tp *TaskProcessor) NewTask(ctx context.Context, taskType string, task Task) error {
@@ -84,9 +90,15 @@ func (tp *TaskProcessor) NewTask(ctx context.Context, taskType string, task Task
 }
 
 func (tp *TaskProcessor) ProcessNextTask(ctx context.Context) error {
+	// 检查并发限制
+	if !tp.tryAcquireWorker() {
+		return nil // 达到并发限制，直接返回
+	}
+	defer tp.releaseWorker()
+
 	processingQueue, err := tp.repo.DequeueTask(ctx)
 	if err != nil {
-		slog.Error("repo task dequeue error", err)
+		slog.Error("repo task dequeue error", "error", err)
 		return err
 	}
 	if processingQueue == nil {
@@ -97,21 +109,21 @@ func (tp *TaskProcessor) ProcessNextTask(ctx context.Context) error {
 	err = task.FromJSON(processingQueue.Payload)
 	if err != nil {
 		if err2 := tp.repo.UpdateTaskFailed(ctx, processingQueue, err); err2 != nil {
-			slog.Error("UpdateTaskFailed error after json unmarshal", err2)
+			slog.Error("UpdateTaskFailed error after json unmarshal", "error", err2)
 		}
 		return err
 	}
 	questionSet, err := tp.enricher.EnrichQuestions(ctx, task.RawQuestions)
 	if err != nil {
 		if err2 := tp.repo.UpdateTaskFailed(ctx, processingQueue, err); err2 != nil {
-			slog.Error("UpdateTaskFailed error", err)
+			slog.Error("UpdateTaskFailed error", "error", err2)
 		}
 		return err
 	}
 	vectors, err := tp.embedder.EmbedBatch(ctx, questionSet.GetEmbeddableTexts())
 	if err != nil {
 		if err2 := tp.repo.UpdateTaskFailed(ctx, processingQueue, err); err2 != nil {
-			slog.Error("UpdateTaskFailed error", err)
+			slog.Error("UpdateTaskFailed error", "error", err2)
 		}
 		return err
 	}
@@ -128,7 +140,7 @@ func (tp *TaskProcessor) ProcessNextTask(ctx context.Context) error {
 		}
 	}
 	if err2 := tp.repo.UpdateTaskCompleted(ctx, processingQueue); err2 != nil {
-		slog.Error("UpdateTaskCompleted error", err2)
+		slog.Error("UpdateTaskCompleted error", "error", err2)
 		return err2
 	}
 
@@ -136,6 +148,12 @@ func (tp *TaskProcessor) ProcessNextTask(ctx context.Context) error {
 }
 
 func (tp *TaskProcessor) ProcessFailedTask(ctx context.Context, maxRetries int) error {
+	// 检查并发限制
+	if !tp.tryAcquireWorker() {
+		return nil // 达到并发限制，直接返回
+	}
+	defer tp.releaseWorker()
+
 	processingQueue, err := tp.repo.DequeueFailedTask(ctx, maxRetries)
 	if err != nil {
 		slog.Error("repo failed task dequeue error", "error", err)
@@ -189,4 +207,78 @@ func (tp *TaskProcessor) ProcessFailedTask(ctx context.Context, maxRetries int) 
 	}
 
 	return nil
+}
+
+func (tp *TaskProcessor) tryAcquireWorker() bool {
+	for {
+		current := tp.activeWorkers.Load()
+		if current >= tp.maxWorkers {
+			return false
+		}
+		if tp.activeWorkers.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (tp *TaskProcessor) releaseWorker() {
+	tp.activeWorkers.Add(-1)
+}
+
+func (tp *TaskProcessor) RunTaskWorkers(ctx context.Context, normalWorkers, retryWorkers, maxRetries int, pollInterval time.Duration, done <-chan struct{}) {
+	for i := 0; i < normalWorkers; i++ {
+		workerID := i + 1
+		go tp.normalTaskWorker(ctx, workerID, pollInterval, done)
+	}
+
+	for i := 0; i < retryWorkers; i++ {
+		workerID := i + 1
+		go tp.retryTaskWorker(ctx, workerID, maxRetries, pollInterval, done)
+	}
+
+	slog.Info("任务处理工作者已启动", "normal_workers", normalWorkers, "retry_workers", retryWorkers, "max_concurrent", tp.maxWorkers)
+}
+
+func (tp *TaskProcessor) normalTaskWorker(ctx context.Context, workerID int, pollInterval time.Duration, done <-chan struct{}) {
+	slog.Info("正常任务工作者启动", "worker_id", workerID)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			slog.Info("正常任务工作者收到关闭信号", "worker_id", workerID)
+			return
+		case <-ctx.Done():
+			slog.Info("正常任务工作者上下文取消", "worker_id", workerID)
+			return
+		case <-ticker.C:
+			err := tp.ProcessNextTask(ctx)
+			if err != nil {
+				slog.Error("正常任务处理失败", "worker_id", workerID, "error", err)
+			}
+		}
+	}
+}
+
+func (tp *TaskProcessor) retryTaskWorker(ctx context.Context, workerID int, maxRetries int, pollInterval time.Duration, done <-chan struct{}) {
+	slog.Info("失败任务重试工作者启动", "worker_id", workerID)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			slog.Info("失败任务重试工作者收到关闭信号", "worker_id", workerID)
+			return
+		case <-ctx.Done():
+			slog.Info("失败任务重试工作者上下文取消", "worker_id", workerID)
+			return
+		case <-ticker.C:
+			err := tp.ProcessFailedTask(ctx, maxRetries)
+			if err != nil {
+				slog.Error("失败任务重试失败", "worker_id", workerID, "error", err)
+			}
+		}
+	}
 }
