@@ -5,11 +5,15 @@ import (
 	"log/slog"
 	"os"
 	"paguu/configs"
+	"paguu/internal/embedding"
 	"paguu/internal/enrich"
+	"paguu/internal/processor"
+	"paguu/internal/storage/postgres"
 	"time"
 
 	"github.com/lmittmann/tint"
 	"github.com/volcengine/volcengine-go-sdk/service/arkruntime"
+	"google.golang.org/genai"
 )
 
 func main() {
@@ -25,14 +29,26 @@ func main() {
 
 	config, err := configs.LoadConfig()
 	if err != nil {
-		slog.Error("加载配置失败: %v", err)
+		slog.Error("加载配置失败", "error", err)
 		panic(err)
 	}
 
-	client := arkruntime.NewClientWithApiKey(
+	// 创建 Volcengine Ark 客户端（用于问题丰富化）
+	arkClient := arkruntime.NewClientWithApiKey(
 		config.Ark.ApiKey,
 		arkruntime.WithBaseUrl(config.Ark.BaseUrl),
 	)
+
+	// 创建 Google Gemini 客户端（用于嵌入）
+	ctx := context.Background()
+	geminiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  config.Gemini.ApiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
+	if err != nil {
+		slog.Error("创建 Gemini 客户端失败", "error", err)
+		panic(err)
+	}
 
 	testQuestions := `
 2. 项目引发：io.ReadAll和io.Copy的区别
@@ -48,15 +64,42 @@ func main() {
 12. 自增主键有什么好处
 `
 
-	qe, err := enrich.NewQuestionsEnricher(client, "./prompts/enrich_questions.txt", config.Ark.Model)
+	questionEnricher, err := enrich.NewQuestionsEnricher(arkClient, config.Ark.EnrichTemplatePath, config.Ark.EnrichModel)
 	if err != nil {
-		slog.Error("QuestionsEnricher init error : ", err)
+		slog.Error("QuestionsEnricher init error", "error", err)
 		panic(err)
 	}
-	_, err = qe.EnrichQuestions(context.TODO(), testQuestions)
+	/*	_, err = questionEnricher.EnrichQuestions(context.TODO(), testQuestions)
+		if err != nil {
+			slog.Error("QuestionsEnricher enrich error : ", err)
+		}*/
+
+	repo, err := postgres.NewRepository(config.Database.DSN)
 	if err != nil {
-		slog.Error("QuestionsEnricher enrich error : ", err)
+		slog.Error("repo init error", "error", err)
+		panic(err)
 	}
 
-	return
+	embedder, err := embedding.NewEmbedder(config.Gemini.EmbeddingModel, geminiClient)
+	if err != nil {
+		slog.Error("embedder init error", "error", err)
+		panic(err)
+	}
+
+	taskProcessor := processor.NewTaskProcessor(questionEnricher, repo, embedder)
+
+	task := processor.Task{
+		RawQuestions: testQuestions,
+	}
+	task.FillMetadata()
+	err = taskProcessor.NewTask(context.TODO(), "default", task)
+	if err != nil {
+		slog.Error("NewTask error", "error", err)
+		return
+	}
+
+	err = taskProcessor.ProcessNextTask(context.TODO())
+	if err != nil {
+		slog.Error("ProcessNextTask error", "error", err)
+	}
 }

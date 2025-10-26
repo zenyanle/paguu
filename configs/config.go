@@ -10,10 +10,19 @@ import (
 
 type Config struct {
 	Ark struct {
-		ApiKey  string `mapstructure:"api_key"`
-		BaseUrl string `mapstructure:"base_url"`
-		Model   string `mapstructure:"model"`
+		ApiKey             string `mapstructure:"api_key"`
+		BaseUrl            string `mapstructure:"base_url"`
+		EnrichModel        string `mapstructure:"enrich_model"`
+		EnrichTemplatePath string `mapstructure:"enrich_template_path"`
+		EmbeddingModel     string `mapstructure:"embedding_model"` // 已废弃，改用 Gemini
 	} `mapstructure:"ark"`
+	Gemini struct {
+		ApiKey         string `mapstructure:"api_key"`
+		EmbeddingModel string `mapstructure:"embedding_model"`
+	} `mapstructure:"gemini"`
+	Database struct {
+		DSN string `mapstructure:"dsn"`
+	} `mapstructure:"database"`
 }
 
 // loadConfig 函数负责使用 viper 加载配置

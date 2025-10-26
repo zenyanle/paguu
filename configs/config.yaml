@@ -1,7 +1,13 @@
 ark:
   api_key: ""
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  model: "deepseek-v3-1-terminus"
+  enrich_model: "deepseek-v3-1-terminus"
+  enrich_template_path: "./prompts/enrich_questions.txt"
+  embedding_model: "doubao-embedding-large-text-240915" # 已废弃，改用 Gemini
 
-# database:
-#   dsn: "user:pass@tcp(127.0.0.1:3306)/dbname"
+gemini:
+  api_key: ""
+  embedding_model: "gemini-embedding-001"
+
+database:
+  dsn: "host=localhost user=myuser password=mypassword dbname=mydb port=5432 sslmode=disable TimeZone=Asia/Shanghai"

@@ -1,5 +1,7 @@
 package enrich
 
+import "strings"
+
 type InterviewQuestionSet struct {
 	Questions []InterviewQuestion `json:"questions"`
 }
@@ -13,6 +15,26 @@ type InterviewQuestion struct {
 	ConciseAnswer string `json:"concise_answer"`
 
 	Tags []string `json:"tags"`
+}
+
+func (set *InterviewQuestionSet) GetEmbeddableTexts() []string {
+	texts := make([]string, 0, len(set.Questions))
+
+	var sb strings.Builder
+
+	for _, q := range set.Questions {
+		sb.Reset()
+
+		sb.WriteString(q.DetailedQuestion)
+
+		sb.WriteString("\n\n")
+
+		sb.WriteString(q.ConciseAnswer)
+
+		texts = append(texts, sb.String())
+	}
+
+	return texts
 }
 
 /*

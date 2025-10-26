@@ -71,7 +71,7 @@ func (qe *QuestionsEnricher) EnrichQuestions(ctx context.Context, questions stri
 	}
 
 	// Extract JSON text content from the response and unmarshal
-	text := ExtractTextFromSingleResponse(resp)
+	text := extractTextFromSingleResponse(resp)
 	if strings.TrimSpace(text) == "" {
 		return InterviewQuestionSet{}, fmt.Errorf("empty response text")
 	}
@@ -86,7 +86,7 @@ func (qe *QuestionsEnricher) EnrichQuestions(ctx context.Context, questions stri
 	return questionSet, nil
 }
 
-func ExtractTextFromSingleResponse(resp *responses.ResponseObject) string {
+func extractTextFromSingleResponse(resp *responses.ResponseObject) string {
 	if resp == nil {
 		return ""
 	}
