@@ -64,6 +64,10 @@ type TaskProcessor struct {
 	embedder      *embedding.Embedder
 	activeWorkers atomic.Int32
 	maxWorkers    int32
+
+	// 轮询控制相关
+	allowPolling atomic.Bool
+	wakeupTime   atomic.Int64 // Unix 时间戳，表示允许轮询的截止时间
 }
 
 func NewTaskProcessor(enricher *enrich.QuestionsEnricher, repo *postgres.Repository, embedder *embedding.Embedder) *TaskProcessor {
@@ -74,6 +78,8 @@ func NewTaskProcessor(enricher *enrich.QuestionsEnricher, repo *postgres.Reposit
 		maxWorkers: 3, // 默认最大并发数为3
 	}
 	tp.activeWorkers.Store(0)
+	tp.allowPolling.Store(false)
+	tp.wakeupTime.Store(0)
 	return tp
 }
 
@@ -86,6 +92,10 @@ func (tp *TaskProcessor) NewTask(ctx context.Context, taskType string, task Task
 	if err != nil {
 		return err
 	}
+
+	// 唤醒轮询：设置允许轮询10分钟
+	tp.wakeupPolling()
+
 	return nil
 }
 
@@ -225,6 +235,33 @@ func (tp *TaskProcessor) releaseWorker() {
 	tp.activeWorkers.Add(-1)
 }
 
+// wakeupPolling 唤醒轮询，允许轮询10分钟
+func (tp *TaskProcessor) wakeupPolling() {
+	now := time.Now()
+	wakeupUntil := now.Add(10 * time.Minute)
+	tp.wakeupTime.Store(wakeupUntil.Unix())
+	tp.allowPolling.Store(true)
+	slog.Info("轮询已唤醒", "duration", "10m", "until", wakeupUntil.Format(time.RFC3339))
+}
+
+// shouldPoll 检查是否应该进行轮询
+func (tp *TaskProcessor) shouldPoll() bool {
+	if !tp.allowPolling.Load() {
+		return false
+	}
+
+	now := time.Now().Unix()
+	wakeupUntil := tp.wakeupTime.Load()
+
+	if now > wakeupUntil {
+		tp.allowPolling.Store(false)
+		slog.Info("轮询超时，进入休眠模式")
+		return false
+	}
+
+	return true
+}
+
 func (tp *TaskProcessor) RunTaskWorkers(ctx context.Context, normalWorkers, retryWorkers, maxRetries int, pollInterval time.Duration, done <-chan struct{}) {
 	for i := 0; i < normalWorkers; i++ {
 		workerID := i + 1
@@ -253,6 +290,13 @@ func (tp *TaskProcessor) normalTaskWorker(ctx context.Context, workerID int, pol
 			slog.Info("正常任务工作者上下文取消", "worker_id", workerID)
 			return
 		case <-ticker.C:
+			// 检查是否应该轮询
+			if !tp.shouldPoll() {
+				// 不允许轮询时，进入自旋等待模式
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
 			err := tp.ProcessNextTask(ctx)
 			if err != nil {
 				slog.Error("正常任务处理失败", "worker_id", workerID, "error", err)
@@ -275,6 +319,13 @@ func (tp *TaskProcessor) retryTaskWorker(ctx context.Context, workerID int, maxR
 			slog.Info("失败任务重试工作者上下文取消", "worker_id", workerID)
 			return
 		case <-ticker.C:
+			// 检查是否应该轮询
+			if !tp.shouldPoll() {
+				// 不允许轮询时，进入自旋等待模式
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
 			err := tp.ProcessFailedTask(ctx, maxRetries)
 			if err != nil {
 				slog.Error("失败任务重试失败", "worker_id", workerID, "error", err)

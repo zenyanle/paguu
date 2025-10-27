@@ -75,6 +75,34 @@ func NewRepository(dsn string) (*Repository, error) {
 	}
 	slog.Info("数据库连接成功")
 
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+
+	// 1. 限制最大连接数，防止打垮数据库
+	// 留一些余地，不要设为 20，比如设为 10 或 15
+	sqlDB.SetMaxOpenConns(10)
+
+	// 2. 关键：允许连接池缩减到 0
+	// 这样在空闲时，所有连接都会被关闭，Neon 才能休眠
+	sqlDB.SetMaxIdleConns(0)
+
+	// 3. 关键：设置连接的最大空闲时间
+	// 让空闲连接（用完后放回池里的连接）在 1-5 分钟后被自动关闭
+	// 这个时间应该比 Neon 的休眠触发时间（比如 5 分钟）要短或相近
+	sqlDB.SetConnMaxIdleTime(2 * time.Minute)
+
+	// 4. (可选) 设置连接的最大生命周期
+	// 有助于连接的轮换，但对于 Neon 场景不是最关键的
+	sqlDB.SetConnMaxLifetime(1 * time.Hour)
+
+	slog.Info("数据库连接池配置完成",
+		"max_open_conns", 10,
+		"max_idle_conns", 0,
+		"conn_max_idle_time", "2m",
+		"conn_max_lifetime", "1h")
+
 	// 1. 启用 vector 扩展
 	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error; err != nil {
 		return nil, fmt.Errorf("failed to create vector extension: %w", err)
